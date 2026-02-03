@@ -1,0 +1,218 @@
+---
+name: "UX Analyzer Roundtrip"
+description: "Iteratively refine UI implementation to match reference screenshot"
+
+context:
+  reference_image: ""        # Path to reference screenshot
+  max_iterations: 3          # Maximum refinement iterations
+  output_dir: "./roundtrip-output"  # Output directory
+
+steps:
+  # Step 1: Analyze reference screenshot
+  - id: analyze_reference
+    type: bash
+    parse_json: true
+    command: |
+      mkdir -p "{{context.output_dir}}"
+      python -m amplifier_ux_analyzer.cli.main analyze \
+        "{{context.reference_image}}" \
+        -o "{{context.output_dir}}/reference-analysis.json"
+      
+      # Output the JSON for next step
+      cat "{{context.output_dir}}/reference-analysis.json"
+    
+  # Step 2: Convert to YAML spec
+  - id: convert_to_spec
+    type: bash
+    command: |
+      python -m amplifier_ux_analyzer.cli.main convert \
+        "{{context.output_dir}}/reference-analysis.json" \
+        "{{context.reference_image}}" \
+        -o "{{context.output_dir}}/reference-spec.yaml"
+      
+      echo "✓ Spec created: {{context.output_dir}}/reference-spec.yaml"
+  
+  # Step 3: Generate HTML from spec (iteration loop starts here)
+  - id: generate_html
+    type: agent
+    agent: self
+    provider: anthropic
+    model: claude-sonnet-4-*
+    parse_json: true
+    prompt: |
+      You are a UI implementation expert. Generate pixel-perfect HTML/CSS/JS from this specification.
+      
+      Read the spec file and generate a complete single-file HTML implementation.
+      
+      **Spec file**: {{context.output_dir}}/reference-spec.yaml
+      
+      {% if context.iteration_feedback %}
+      **ITERATION FEEDBACK**: 
+      {{context.iteration_feedback}}
+      
+      Please address the feedback above in this iteration.
+      {% endif %}
+      
+      **Requirements**:
+      - Single HTML file with embedded CSS and JavaScript
+      - Match all colors exactly using hex codes from spec
+      - Match dimensions exactly
+      - Implement all components in the structure
+      - Use semantic HTML5
+      - Use modern CSS (flexbox/grid)
+      - Pure vanilla JavaScript (no frameworks)
+      
+      **Output**: Return JSON with the HTML code:
+      ```json
+      {
+        "html": "<complete HTML code here>"
+      }
+      ```
+  
+  # Step 4: Save HTML and render screenshot
+  - id: render_html
+    type: bash
+    command: |
+      # Extract HTML from previous step
+      echo '{{steps.generate_html.result.html}}' > "{{context.output_dir}}/generated.html"
+      
+      # Render with agent-browser
+      agent-browser set viewport 1920 1080
+      agent-browser open "file://$(realpath {{context.output_dir}}/generated.html)"
+      agent-browser wait 2000
+      agent-browser screenshot "{{context.output_dir}}/generated-screenshot.png" --full
+      agent-browser close
+      
+      echo "✓ Screenshot saved: {{context.output_dir}}/generated-screenshot.png"
+  
+  # Step 5: Analyze generated screenshot
+  - id: analyze_generated
+    type: bash
+    parse_json: true
+    command: |
+      python -m amplifier_ux_analyzer.cli.main analyze \
+        "{{context.output_dir}}/generated-screenshot.png" \
+        -o "{{context.output_dir}}/generated-analysis.json"
+      
+      cat "{{context.output_dir}}/generated-analysis.json"
+  
+  # Step 6: Compare screenshots
+  - id: compare_screenshots
+    type: bash
+    parse_json: true
+    command: |
+      python -m amplifier_ux_analyzer.cli.main compare \
+        "{{context.reference_image}}" \
+        "{{context.output_dir}}/generated-screenshot.png" \
+        --output "{{context.output_dir}}/comparison-diff.png" \
+        --json
+  
+  # Step 7: Evaluate and decide iteration
+  - id: evaluate_match
+    type: agent
+    agent: self
+    provider: anthropic
+    model: claude-haiku-*  # Fast model for evaluation
+    parse_json: true
+    prompt: |
+      Evaluate if the generated UI matches the reference sufficiently.
+      
+      **Comparison Results**:
+      SSIM: {{steps.compare_screenshots.result.ssim}}
+      MSE: {{steps.compare_screenshots.result.mse}}
+      
+      **Reference Analysis**:
+      Colors: {{steps.analyze_reference.result.colors | length}} dominant colors
+      Regions: {{steps.analyze_reference.result.regions | length}} layout regions
+      Elements: {{steps.analyze_reference.result.elements | length}} UI elements
+      
+      **Generated Analysis**:
+      Colors: {{steps.analyze_generated.result.colors | length}} dominant colors
+      Regions: {{steps.analyze_generated.result.regions | length}} layout regions
+      Elements: {{steps.analyze_generated.result.elements | length}} UI elements
+      
+      **Decision Criteria**:
+      - SSIM > 0.85 = ACCEPTABLE
+      - SSIM 0.75-0.85 = ITERATE if iterations remaining
+      - SSIM < 0.75 = ITERATE (critical issues)
+      
+      Current iteration: {{context.current_iteration | default(1)}}
+      Max iterations: {{context.max_iterations}}
+      
+      Return JSON:
+      ```json
+      {
+        "acceptable": true/false,
+        "should_iterate": true/false,
+        "feedback": "Specific issues to address in next iteration",
+        "ssim_score": {{steps.compare_screenshots.result.ssim}}
+      }
+      ```
+  
+  # Step 8: Conditional iteration (recursive step call)
+  - id: iterate_if_needed
+    type: bash
+    command: |
+      ACCEPTABLE='{{steps.evaluate_match.result.acceptable}}'
+      SHOULD_ITERATE='{{steps.evaluate_match.result.should_iterate}}'
+      CURRENT_ITER={{context.current_iteration | default(1)}}
+      MAX_ITER={{context.max_iterations}}
+      
+      if [ "$ACCEPTABLE" = "true" ]; then
+        echo "✅ Match acceptable! SSIM: {{steps.evaluate_match.result.ssim_score}}"
+        echo "Final HTML: {{context.output_dir}}/generated.html"
+        echo "Comparison: {{context.output_dir}}/comparison-diff.png"
+        exit 0
+      fi
+      
+      if [ "$SHOULD_ITERATE" = "true" ] && [ $CURRENT_ITER -lt $MAX_ITER ]; then
+        NEXT_ITER=$((CURRENT_ITER + 1))
+        echo "🔄 Iteration $CURRENT_ITER complete. Starting iteration $NEXT_ITER..."
+        echo "Feedback: {{steps.evaluate_match.result.feedback}}"
+        
+        # Set iteration context and restart from generate_html
+        # NOTE: This is pseudo-code - recipe engine doesn't support recursion yet
+        # For now, just report that another iteration is needed
+        echo "⚠️  Another iteration recommended. Re-run recipe with iteration feedback."
+        exit 0
+      fi
+      
+      echo "⚠️  Max iterations reached. Best result saved."
+      echo "Final SSIM: {{steps.evaluate_match.result.ssim_score}}"
+      exit 0
+
+deliverable:
+  type: structured
+  description: "Roundtrip results"
+  content: |
+    # UX Analyzer Roundtrip Results
+    
+    ## Reference Image
+    {{context.reference_image}}
+    
+    ## Final Results
+    - **HTML**: {{context.output_dir}}/generated.html
+    - **Screenshot**: {{context.output_dir}}/generated-screenshot.png
+    - **Comparison**: {{context.output_dir}}/comparison-diff.png
+    
+    ## Metrics
+    - **SSIM**: {{steps.compare_screenshots.result.ssim}}
+    - **MSE**: {{steps.compare_screenshots.result.mse}}
+    - **Match Quality**: {% if steps.evaluate_match.result.acceptable %}✅ Acceptable{% else %}⚠️ Needs refinement{% endif %}
+    
+    ## Analysis Comparison
+    
+    ### Reference
+    - Colors: {{steps.analyze_reference.result.colors | length}}
+    - Regions: {{steps.analyze_reference.result.regions | length}}
+    - Elements: {{steps.analyze_reference.result.elements | length}}
+    
+    ### Generated
+    - Colors: {{steps.analyze_generated.result.colors | length}}
+    - Regions: {{steps.analyze_generated.result.regions | length}}
+    - Elements: {{steps.analyze_generated.result.elements | length}}
+    
+    {% if steps.evaluate_match.result.feedback %}
+    ## Feedback
+    {{steps.evaluate_match.result.feedback}}
+    {% endif %}

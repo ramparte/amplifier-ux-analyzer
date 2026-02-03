@@ -1,0 +1,87 @@
+---
+name: "simple-ux-generation"
+description: "Generate UI from reference screenshot (no iteration)"
+version: "1.0.0"
+
+context:
+  reference_image: ""
+  output_dir: "./generation-output"
+
+steps:
+  - id: analyze
+    agent: self
+    prompt: |
+      Run the UX analyzer on the reference screenshot.
+      
+      Execute these commands:
+      ```bash
+      mkdir -p "{{output_dir}}"
+      python -m amplifier_ux_analyzer.cli.main analyze \
+        "{{reference_image}}" \
+        -o "{{output_dir}}/analysis.json"
+      ```
+      
+      Then read and output the contents of {{output_dir}}/analysis.json
+    output: analysis_json
+    timeout: 300
+
+  - id: convert
+    agent: self
+    prompt: |
+      Convert the analysis JSON to a YAML spec file.
+      
+      Execute this command:
+      ```bash
+      python -m amplifier_ux_analyzer.cli.main convert \
+        "{{output_dir}}/analysis.json" \
+        "{{reference_image}}" \
+        -o "{{output_dir}}/spec.yaml"
+      ```
+      
+      Then read and output the contents of {{output_dir}}/spec.yaml
+    output: spec_yaml
+    timeout: 300
+  
+  - id: generate
+    agent: self
+    provider: anthropic
+    model: claude-sonnet-4-*
+    prompt: |
+      Generate HTML/CSS/JS from this UI specification.
+      
+      Read the spec file: {{output_dir}}/spec.yaml
+      
+      Create a single HTML file with embedded CSS and JavaScript that matches the spec exactly.
+      
+      Requirements:
+      - Match all colors from the spec using exact hex codes
+      - Implement the component structure as specified
+      - Use semantic HTML5
+      - Use modern CSS (flexbox/grid for layouts)
+      - Pure vanilla JavaScript (no frameworks)
+      - Single self-contained HTML file
+      
+      Write the complete HTML to: {{output_dir}}/generated.html
+      
+      After writing the file, output a summary of what you created.
+    output: generation_summary
+    timeout: 600
+
+deliverable:
+  type: text
+  description: "Generated UI"
+  content: |
+    # Simple UX Generation Results
+    
+    Generated from: {{reference_image}}
+    
+    ## Output Files
+    - **Analysis**: {{output_dir}}/analysis.json
+    - **Spec**: {{output_dir}}/spec.yaml
+    - **HTML**: {{output_dir}}/generated.html
+    
+    ## Next Steps
+    Open {{output_dir}}/generated.html in a browser to view the generated UI.
+    
+    ## Generation Summary
+    {{generation_summary}}
